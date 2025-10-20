@@ -1957,6 +1957,8 @@ class DirectReductionForecaster(BaseForecaster, _ReducerMixin):
         # -----------------
         "tests:core": True,  # should tests be triggered by framework changes?
         "tests:libs": ["sktime.transformations.series.lag"],
+        # -----------------
+        "capability:missing_values": True,
     }
 
     def __init__(
@@ -2364,6 +2366,8 @@ class RecursiveReductionForecaster(BaseForecaster, _ReducerMixin):
         # CI and test flags
         # -----------------
         "tests:libs": ["sktime.transformations.series.lag"],
+        # -----------------
+        "capability:missing_values": True,
     }
 
     def __init__(
