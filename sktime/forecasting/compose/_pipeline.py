@@ -722,20 +722,49 @@ class ForecastingPipeline(_Pipeline):
         return self
 
     def _transform(self, X=None, y=None):
-        # If X is not given or ignored, just passthrough the data without transformation
-        if not self.skip_trafos_:
-            for _, _, transformer in self._iter_transformers():
-                # if y is required but not passed,
-                # we create a zero-column y from the forecasting horizon
-                requires_y = transformer.get_tag("requires_y", False)
-                if isinstance(y, ForecastingHorizon) and requires_y:
-                    y = y.to_absolute_index(self.cutoff)
-                    y = pd.DataFrame(index=y)
-                elif isinstance(y, ForecastingHorizon) and not requires_y:
-                    y = None
-                # else we just pass on y
-                X = transformer.transform(X=X, y=y)
+        """Transform X using fitted transformers."""
+        if self.skip_trafos_:
+            return X
+
+        for _, _, transformer in self._iter_transformers():
+            y = self._prepare_y_for_transformer(transformer, y)
+            X = transformer.transform(X=X, y=y)
+
         return X
+
+    def _prepare_y_for_transformer(self, transformer, y):
+        """Prepare y parameter based on transformer requirements."""
+        requires_y = transformer.get_tag("requires_y", False)
+
+        if not isinstance(y, ForecastingHorizon):
+            return y
+
+        if not requires_y:
+            return None
+
+        # Convert forecasting horizon to absolute index
+        absolute_y_index = y.to_absolute_index(self.cutoff)
+
+        if not isinstance(self._y.index, pd.MultiIndex):
+            return pd.DataFrame(index=absolute_y_index)
+
+        # Create MultiIndex for panel data
+        multiindex_y = self._create_multiindex_for_y(absolute_y_index)
+        return pd.DataFrame(index=multiindex_y)
+
+    def _create_multiindex_for_y(self, date_index):
+        """Create MultiIndex combining hierarchy levels with date index."""
+        from itertools import product
+
+        hierarchy_levels = self._y.index.droplevel(-1).unique().to_list()
+        level_date_combinations = product(hierarchy_levels, date_index)
+
+        expanded_tuples = [
+            (*hierarchy_tuple, date)
+            for hierarchy_tuple, date in level_date_combinations
+        ]
+
+        return pd.MultiIndex.from_tuples(expanded_tuples, names=self._y.index.names)
 
 
 # removed transform and inverse_transform as long as y can only be a pd.Series
