@@ -324,13 +324,14 @@ class EnsembleForecaster(_HeterogenousEnsembleForecaster):
         "authors": ["mloning", "GuzalBulatova", "aiwalter", "RNKuhns", "AnH0ang"],
         "capability:exogenous": True,
         "requires-fh-in-fit": False,
-        "capability:missing_values": False,
+        "capability:missing_values": True,
         "X_inner_mtype": ["pd.DataFrame", "pd-multiindex", "pd_multiindex_hier"],
         "y_inner_mtype": ["pd.DataFrame", "pd-multiindex", "pd_multiindex_hier"],
         "scitype:y": "both",
         # CI and test flags
         # -----------------
         "tests:core": True,  # should tests be triggered by framework changes?
+        # -----------------
     }
 
     def __init__(self, forecasters, n_jobs=None, aggfunc="mean", weights=None):
