@@ -7,38 +7,142 @@ to produce multi-step probabilistic forecasts using ancestral sampling.
 __author__ = ["marrov"]
 __all__ = ["MCRecursiveProbaReductionForecaster"]
 
+import inspect
+import threading
+
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
 
 from sktime.forecasting.base import ForecastingHorizon
 from sktime.forecasting.base._base_proba import BaseProbaForecaster
-from sktime.forecasting.compose._reduce import _get_notna_idx, _ReducerMixin
+from sktime.forecasting.compose._reduce import (
+    _get_notna_idx,
+    _ReducerMixin,
+    slice_at_ix,
+)
 from sktime.utils.dependencies import _check_soft_dependencies
 from sktime.utils.sklearn import prep_skl_df
+from sktime.utils.warnings import warn
+
+_NUMPY_GLOBAL_RNG_LOCK = threading.Lock()
 
 
-def _slice_at_ix(df, ix):
-    """Slice dataframe at index value, return row as DataFrame.
+def _get_last_X_for_index(X, target_idx):
+    """Get fallback exogenous values aligned to ``target_idx``.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to slice.
-    ix : hashable
-        Index value to slice at.
+    X : pd.DataFrame
+        DataFrame containing at least one row of exogenous data.
+    target_idx : pd.Index or pd.MultiIndex
+        Target index to align the fallback values to.
 
     Returns
     -------
     pd.DataFrame
-        Single row (or rows for MultiIndex) matching the index value.
+        DataFrame with fallback values aligned to target_idx.
     """
-    if isinstance(df.index, pd.MultiIndex):
-        # For MultiIndex, get all rows where the last level matches ix
-        mask = df.index.get_level_values(-1) == ix
-        return df.loc[mask]
-    else:
-        return df.loc[[ix]]
+    if len(X) == 0:
+        raise ValueError("`X` must contain at least one row.")
+
+    if isinstance(target_idx, pd.MultiIndex):
+        if isinstance(X.index, pd.MultiIndex):
+            levels = list(range(X.index.nlevels - 1))
+            X_last = X.groupby(level=levels, as_index=False).tail(1).copy()
+            X_last.index = X_last.index.droplevel(-1)
+            target_no_time = target_idx.droplevel(-1)
+            X_last = X_last.reindex(target_no_time)
+            X_last.index = target_idx
+            return X_last
+
+        X_last_vals = np.tile(X.iloc[[-1]].to_numpy(), (len(target_idx), 1))
+        X_last = pd.DataFrame(X_last_vals, columns=X.columns, index=target_idx)
+        return X_last
+
+    X_last = X.iloc[[-1]].copy()
+    X_last.index = target_idx
+    return X_last
+
+
+def _align_X_columns(X, columns):
+    """Align ``X`` columns to ``columns`` and remove duplicate labels.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        DataFrame to align columns for.
+    columns : pd.Index or list
+        Target column labels to align to.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with aligned columns.
+    """
+    X = X.copy()
+    columns = pd.Index(columns).drop_duplicates()
+
+    # Use name-aware reindex to avoid silently reassigning columns by position.
+    if X.columns.tolist() != list(columns):
+        X = X.reindex(columns=columns)
+
+    if X.columns.has_duplicates:
+        X = X.loc[:, ~X.columns.duplicated(keep="first")]
+        X = X.reindex(columns=columns)
+
+    return X
+
+
+def _pool_exogenous(X_hist, X_new=None):
+    """Pool historic and new exogenous data with stable column schema.
+
+    Parameters
+    ----------
+    X_hist : pd.DataFrame
+        Historic exogenous data.
+    X_new : pd.DataFrame, optional
+        New exogenous data to pool with historic data.
+
+    Returns
+    -------
+    pd.DataFrame
+        Combined DataFrame with deduplicated index (keep last).
+    """
+    x_cols = pd.Index(X_hist.columns).drop_duplicates()
+    X_hist = _align_X_columns(X_hist, x_cols)
+
+    if X_new is None:
+        return X_hist
+
+    X_new = _align_X_columns(X_new, x_cols)
+    X_pool = pd.concat([X_hist, X_new], axis=0)
+    X_pool = X_pool[~X_pool.index.duplicated(keep="last")]
+
+    return X_pool
+
+
+def _align_X_index(X, target_index):
+    """Align exogenous row index to ``target_index`` by shape where possible.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        DataFrame to align index for.
+    target_index : pd.Index
+        Target index to align to.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with aligned index.
+    """
+    X = X.copy()
+    if len(X) == len(target_index):
+        X.index = target_index
+        return X
+
+    return X.reindex(target_index)
 
 
 class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
@@ -54,14 +158,14 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
 
     Algorithm details:
 
-    In ``fit``, given endogeneous time series ``y`` and possibly exogeneous ``X``:
+    In ``fit``, given endogenous time series ``y`` and possibly exogenous ``X``:
         fits ``estimator`` to feature-label pairs for one-step-ahead prediction:
         features = ``y(t)``, ``y(t-1)``, ..., ``y(t-window_length+1)``,
                    if provided: ``X(t+1)``
         labels = ``y(t+1)``
         ranging over all ``t`` where the above have been observed
 
-    In ``predict_proba``, given possibly exogeneous ``X``, at cutoff time ``c``:
+    In ``predict_proba``, given possibly exogenous ``X``, at cutoff time ``c``:
         1. Generate ``n_samples`` Monte Carlo trajectories using ancestral sampling
         2. For each trajectory and each horizon step ``h``:
            a. Get probabilistic prediction from estimator using lagged features
@@ -121,18 +225,23 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
     >>> forecaster.fit(y)  # doctest: +ELLIPSIS
     MCRecursiveProbaReductionForecaster(...)
     >>> y_pred_dist = forecaster.predict_proba(fh=range(1, 13))
+    >>> len(y_pred_dist.mean()) == 12
+    True
     """
 
     _tags = {
         "authors": ["marrov"],
-        "python_dependencies": ["skpro>=2.11.0"],
+        "python_dependencies": ["skpro>=2,<2.12.0"],
         "requires-fh-in-fit": False,
         "capability:exogenous": True,
+        "capability:insample": False,
         "capability:pred_int": True,
+        "capability:pred_int:insample": False,
         "capability:random_state": True,
         "scitype:y": "both",
         "X_inner_mtype": ["pd.DataFrame", "pd-multiindex", "pd_multiindex_hier"],
         "y_inner_mtype": ["pd.DataFrame", "pd-multiindex", "pd_multiindex_hier"],
+        "tests:libs": ["sktime.transformations.series.lag"],
     }
 
     def __init__(
@@ -166,8 +275,6 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
                 "Use RecursiveReductionForecaster for non-probabilistic estimators."
             )
 
-        self._est_type = _est_type
-
         if pooling == "local":
             mtypes = "pd.DataFrame"
         elif pooling == "global":
@@ -194,7 +301,7 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         y : pd.DataFrame
             Time series to fit the forecaster to.
         X : pd.DataFrame, optional
-            Exogeneous time series.
+            Exogenous time series.
         fh : ForecastingHorizon
             Forecasting horizon.
 
@@ -206,6 +313,8 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
 
         impute_method = self.impute_method
         lags = self._lags
+
+        self._fit_fallback_mean_ = False
 
         lagger_y_to_X = Lag(lags=lags, index_out="extend")
 
@@ -229,7 +338,15 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         notna_idx = Xtt_notna_idx.intersection(y.index)
 
         if len(notna_idx) == 0:
+            warn(
+                "No valid lagged rows were produced in fit; this can happen when "
+                "`window_length` is larger than available observations. Falling back "
+                "to constant mean forecasts via `y.mean()`.",
+                obj=self,
+                stacklevel=2,
+            )
             self.estimator_ = y.mean()
+            self._fit_fallback_mean_ = True
             return self
 
         yt = y.loc[notna_idx]
@@ -257,7 +374,7 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         fh : ForecastingHorizon
             Forecasting horizon.
         X : pd.DataFrame, optional
-            Exogeneous time series.
+            Exogenous time series.
 
         Returns
         -------
@@ -275,7 +392,7 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         fh : ForecastingHorizon
             Forecasting horizon.
         X : pd.DataFrame, optional
-            Exogeneous time series.
+            Exogenous time series.
         marginal : bool, optional, default=True
             Whether returned distribution is marginal by time index.
 
@@ -285,10 +402,8 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
             Predictive distribution.
             Returns an Empirical distribution from the MC samples.
         """
-        if X is not None and self._X is not None:
-            X_pool = X.combine_first(self._X)
-        elif X is None and self._X is not None:
-            X_pool = self._X
+        if self._X is not None:
+            X_pool = _pool_exogenous(self._X, X)
         else:
             X_pool = X
 
@@ -296,7 +411,7 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         y_cols = self._y.columns
 
         # Fallback for edge case: no valid training data
-        if isinstance(self.estimator_, pd.Series):
+        if self._fit_fallback_mean_:
             n_horizons = len(fh_idx)
             samples = np.full(
                 (self.n_samples, n_horizons, len(y_cols)),
@@ -321,14 +436,14 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         fh : ForecastingHorizon
             Forecasting horizon.
         X_pool : pd.DataFrame or None
-            Pooled exogeneous data.
+            Pooled exogenous data.
 
         Returns
         -------
         trajectories : dict
             Dictionary mapping instance identifiers to trajectory arrays.
             For single series, key is None.
-            Each array has shape (n_samples, n_horizons).
+            Each array has shape (n_samples, n_horizons, n_y_cols).
         fh_time_idx : pd.Index
             The time index for the forecasting horizon (without instance levels).
         """
@@ -341,6 +456,7 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
 
         fh_rel = fh.to_relative(self.cutoff)
         y_lags_rel = list(fh_rel)
+        horizon_to_idx = {h: i for i, h in enumerate(y_lags_rel)}
         max_horizon = max(y_lags_rel)
         n_horizons = len(y_lags_rel)
 
@@ -371,32 +487,41 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         y_plus_one_init = lag_plus_init.fit_transform(self._y)
 
         first_predict_idx = y_plus_one_init.iloc[[-1]].index.get_level_values(-1)[0]
-        Xtt_template = _slice_at_ix(Xtt_initial, first_predict_idx)
+        Xtt_template = slice_at_ix(Xtt_initial, first_predict_idx)
+        x_template_index = Xtt_template.index
+
+        X_fallback_df = None
+        exog_cols = None
 
         if X_pool is not None:
+            exog_cols = pd.Index(X_pool.columns).drop_duplicates()
+            X_fallback_df = _get_last_X_for_index(X_pool, x_template_index)
+            X_fallback_df = _align_X_columns(X_fallback_df, exog_cols)
             try:
-                X_at_idx = _slice_at_ix(X_pool, first_predict_idx)
-                Xtt_template = pd.concat([X_at_idx, Xtt_template], axis=1)
+                X_at_idx = slice_at_ix(X_pool, first_predict_idx)
+                if len(X_at_idx) == 0:
+                    raise KeyError(first_predict_idx)
+                X_at_idx = _align_X_index(X_at_idx, x_template_index)
+                X_at_idx = _align_X_columns(X_at_idx, exog_cols)
+                X_at_idx = X_at_idx.fillna(X_fallback_df)
             except (KeyError, IndexError):
-                # If X at first_predict_idx not available, use last available X
-                # This ensures we have the right column structure for the estimator
-                X_last = X_pool.iloc[[-1]]
-                # Get just the values, using same index structure as Xtt_template
-                X_fallback_df = X_last.copy()
-                X_fallback_df.index = Xtt_template.index
-                Xtt_template = pd.concat([X_fallback_df, Xtt_template], axis=1)
+                X_at_idx = X_fallback_df
+
+            X_fallback_df = X_at_idx.copy()
+            Xtt_template = pd.concat([X_at_idx, Xtt_template], axis=1)
 
         feature_cols = Xtt_template.columns.tolist()
         n_instances = len(Xtt_template) if is_hierarchical else 1
 
         # Initialize feature arrays: shape (n_samples, n_instances, n_features)
-        initial_features = prep_skl_df(Xtt_template).values
+        Xtt_template = prep_skl_df(Xtt_template)
+        initial_features = Xtt_template.values
+        feature_cols = Xtt_template.columns
         sample_features = np.tile(initial_features, (n_samples, 1, 1))
 
         # Precompute exogenous features for each horizon step
         fh_abs = fh.to_absolute(self.cutoff)
         X_features_by_step = {}
-        X_fallback = None
         if X_pool is not None:
             for step_idx in range(max_horizon):
                 horizon = step_idx + 1
@@ -406,19 +531,22 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
                 fh_step_abs = fh_step.to_absolute_index(self._cutoff)
                 predict_time = fh_step_abs[0]
                 try:
-                    X_at_idx = _slice_at_ix(X_pool, predict_time)
+                    X_at_idx = slice_at_ix(X_pool, predict_time)
+                    if len(X_at_idx) == 0:
+                        raise KeyError(predict_time)
+                    X_at_idx = _align_X_index(X_at_idx, x_template_index)
+                    X_at_idx = _align_X_columns(X_at_idx, exog_cols)
+                    if X_fallback_df is not None:
+                        X_at_idx = X_at_idx.fillna(X_fallback_df)
                     X_features_by_step[step_idx] = prep_skl_df(X_at_idx).values
-                    if X_fallback is None:
-                        X_fallback = X_features_by_step[step_idx]
+                    X_fallback_df = X_at_idx
                 except (KeyError, IndexError):
-                    if X_fallback is not None:
-                        X_features_by_step[step_idx] = X_fallback
+                    if X_fallback_df is not None:
+                        X_features_by_step[step_idx] = prep_skl_df(X_fallback_df).values
 
         n_lag_features = Xt_initial.shape[1]
-        n_exog_features = (
-            len(feature_cols) - n_lag_features if X_pool is not None else 0
-        )
-        n_y_cols = len(y_cols)
+        n_exog_features = len(exog_cols) if X_pool is not None else 0
+        sample_supports_random_state = None
 
         for step_idx in range(max_horizon):
             batch_features = sample_features.reshape(n_samples * n_instances, -1)
@@ -430,15 +558,23 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
                     batch_features[:, :n_exog_features] = X_batch
 
             Xt_batch = pd.DataFrame(batch_features, columns=feature_cols)
-            Xt_batch = prep_skl_df(Xt_batch)
 
             pred_dist = estimator.predict_proba(Xt_batch)
 
-            # Seed per-step for reproducibility (skpro uses global random state)
-            if self.random_state is not None:
-                sample_seed = rng.integers(0, 2**31)
-                np.random.seed(sample_seed)
-            sampled_df = pred_dist.sample(n_samples=1)
+            if sample_supports_random_state is None:
+                try:
+                    sample_supports_random_state = (
+                        "random_state" in inspect.signature(pred_dist.sample).parameters
+                    )
+                except (TypeError, ValueError):
+                    sample_supports_random_state = False
+
+            sampled_df = self._sample_distribution_row(
+                pred_dist=pred_dist,
+                rng=rng,
+                sample_supports_random_state=sample_supports_random_state,
+            )
+
             sampled_values = (
                 sampled_df.values.flatten()
                 if hasattr(sampled_df, "values")
@@ -448,8 +584,8 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
 
             # Store trajectory values for requested horizons
             horizon = step_idx + 1
-            if horizon in y_lags_rel:
-                traj_idx = y_lags_rel.index(horizon)
+            traj_idx = horizon_to_idx.get(horizon)
+            if traj_idx is not None:
                 if is_hierarchical:
                     for inst_num, inst in enumerate(instance_idx):
                         trajectories[inst][:, traj_idx, :] = sampled_values[
@@ -461,28 +597,53 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
             # Shift lag features and insert new sampled values at lag_0
             window_length = self.window_length
             start_idx = n_exog_features
+            lag_end_idx = start_idx + n_lag_features
 
-            # Vectorized lag shifting: roll features and update lag_0 with new samples
+            # Shift lag block one step to the right and write new values into lag_0.
             if window_length > 1:
-                # Shift lag features: move later positions to earlier positions
-                # lag_i+1 <- lag_i for i = window_length-2 down to 0
-                for lag in range(window_length - 1, 0, -1):
-                    for col in range(n_y_cols):
-                        src_pos = start_idx + (lag - 1) * n_y_cols + col
-                        dst_pos = start_idx + lag * n_y_cols + col
-                        if dst_pos < start_idx + n_lag_features:
-                            sample_features[:, :, dst_pos] = sample_features[
-                                :, :, src_pos
-                            ]
+                sample_features[:, :, start_idx + n_y_cols : lag_end_idx] = (
+                    sample_features[:, :, start_idx : lag_end_idx - n_y_cols]
+                )
 
-            # Set lag_0 to the new sampled values
-            for col in range(n_y_cols):
-                sample_features[:, :, start_idx + col] = sampled_values[:, :, col]
+            sample_features[:, :, start_idx : start_idx + n_y_cols] = sampled_values
 
         # Get the time-only index for the forecast horizon
         fh_time_idx = pd.Index(list(fh_abs))
 
         return trajectories, fh_time_idx
+
+    def _sample_distribution_row(self, pred_dist, rng, sample_supports_random_state):
+        """Sample one draw from ``pred_dist`` with reproducibility-first policy.
+
+        The preferred route is to pass ``random_state`` to the distribution ``sample``
+        method. If unavailable, we preserve deterministic behavior by temporarily
+        seeding NumPy's global RNG under a process-local lock.
+        """
+        if self.random_state is None:
+            return pred_dist.sample(n_samples=1)
+
+        sample_seed = int(rng.integers(0, 2**31))
+
+        if sample_supports_random_state:
+            try:
+                return pred_dist.sample(n_samples=1, random_state=sample_seed)
+            except TypeError:
+                # Signature introspection may over-report support in some wrappers.
+                pass
+
+        # Reproducibility-first fallback for distributions that do not accept a
+        # call-level random_state argument.
+        #
+        # We serialize local global-RNG mutation with a lock to avoid races between
+        # concurrent calls from this estimator. External code mutating global RNG
+        # without the same lock can still interfere.
+        with _NUMPY_GLOBAL_RNG_LOCK:
+            random_state_prev = np.random.get_state()
+            np.random.seed(sample_seed)
+            try:
+                return pred_dist.sample(n_samples=1)
+            finally:
+                np.random.set_state(random_state_prev)
 
     def _build_empirical_from_trajectories(
         self, trajectories, fh_idx, fh_time_idx, y_cols
@@ -510,50 +671,45 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         n_samples = self.n_samples
         is_hierarchical = isinstance(fh_idx, pd.MultiIndex)
 
-        sample_indices = []
-        row_indices = []
-        values = []
+        n_horizons = len(fh_time_idx)
+        n_rows = n_samples * n_horizons
+
+        # Pre-build repeated index arrays (C-order so sample varies slowest)
+        sample_arange = np.arange(n_samples)
+        s_arr = np.repeat(sample_arange, n_horizons)
+        fh_time_arr = np.array(list(fh_time_idx), dtype=object)
+        t_arr = np.tile(fh_time_arr, n_samples)
 
         if is_hierarchical:
-            # For hierarchical data, iterate over instances and time
-            # The fh_idx already contains the full (instance..., time) tuples
-            for inst, traj_array in trajectories.items():
-                for sample_idx in range(n_samples):
-                    for h_idx, time_val in enumerate(fh_time_idx):
-                        sample_indices.append(sample_idx)
-                        if isinstance(inst, tuple):
-                            row_indices.append(inst + (time_val,))
-                        else:
-                            row_indices.append((inst, time_val))
-                        # traj_array shape is (n_samples, n_horizons, n_y_cols)
-                        values.append(traj_array[sample_idx, h_idx, :])
-
-            # Create MultiIndex with sample as first level, then instance+time levels
-            # Get the level names from fh_idx
             fh_names = list(fh_idx.names)
             spl_names = ["sample"] + fh_names
 
-            # Build tuples with sample as first element
-            spl_tuples = [
-                (s,) + (r if isinstance(r, tuple) else (r,))
-                for s, r in zip(sample_indices, row_indices)
-            ]
-            multi_idx = pd.MultiIndex.from_tuples(spl_tuples, names=spl_names)
+            spl_parts = []
+            for inst, traj_array in trajectories.items():
+                # Build per-instance index entirely from numpy arrays (no Python loops)
+                if isinstance(inst, tuple):
+                    arrays = (
+                        [s_arr]
+                        + [np.full(n_rows, v, dtype=object) for v in inst]
+                        + [t_arr]
+                    )
+                else:
+                    arrays = [s_arr, np.full(n_rows, inst, dtype=object), t_arr]
+
+                idx = pd.MultiIndex.from_arrays(arrays, names=spl_names)
+                # traj_array: (n_samples, n_horizons, n_y_cols) — reshape is zero-copy
+                vals = traj_array.reshape(n_rows, len(y_cols))
+                spl_parts.append(pd.DataFrame(vals, index=idx, columns=y_cols))
+
+            spl_df = pd.concat(spl_parts, axis=0)
         else:
-            # For single series, simple (sample, time) structure
+            # Single series: (sample, time) index
             traj_array = trajectories[None]
-            for sample_idx in range(n_samples):
-                for h_idx, time_val in enumerate(fh_time_idx):
-                    sample_indices.append(sample_idx)
-                    row_indices.append(time_val)
-                    # traj_array shape is (n_samples, n_horizons, n_y_cols)
-                    values.append(traj_array[sample_idx, h_idx, :])
-
             multi_idx = pd.MultiIndex.from_arrays(
-                [sample_indices, row_indices], names=["sample", "time"]
+                [s_arr, t_arr], names=["sample", "time"]
             )
-
-        spl_df = pd.DataFrame(np.array(values), index=multi_idx, columns=y_cols)
+            vals = traj_array.reshape(n_rows, len(y_cols))
+            spl_df = pd.DataFrame(vals, index=multi_idx, columns=y_cols)
 
         # Create Empirical distribution
         pred_dist = Empirical(spl=spl_df, index=fh_idx, columns=y_cols)
@@ -579,143 +735,31 @@ class MCRecursiveProbaReductionForecaster(BaseProbaForecaster, _ReducerMixin):
         """
         from skpro.distributions import Empirical
 
-        n_samples = samples.shape[0]
+        n_samples, n_points, n_cols = samples.shape
+        values = samples.reshape(n_samples * n_points, n_cols)
 
-        sample_indices = []
-        time_indices = []
-        values = []
+        sample_level = np.repeat(np.arange(n_samples), n_points)
 
-        for sample_idx in range(n_samples):
-            for h_idx, time_idx in enumerate(fh_idx):
-                sample_indices.append(sample_idx)
-                time_indices.append(time_idx)
-                values.append(samples[sample_idx, h_idx, :])
+        if isinstance(fh_idx, pd.MultiIndex):
+            fh_level_arrays = [
+                np.tile(fh_idx.get_level_values(i).to_numpy(), n_samples)
+                for i in range(fh_idx.nlevels)
+            ]
+            multi_idx = pd.MultiIndex.from_arrays(
+                [sample_level] + fh_level_arrays,
+                names=["sample"] + list(fh_idx.names),
+            )
+        else:
+            fh_values = np.tile(fh_idx.to_numpy(), n_samples)
+            fh_name = fh_idx.name if fh_idx.name is not None else "time"
+            multi_idx = pd.MultiIndex.from_arrays(
+                [sample_level, fh_values],
+                names=["sample", fh_name],
+            )
 
-        multi_idx = pd.MultiIndex.from_arrays(
-            [sample_indices, time_indices], names=["sample", "time"]
-        )
-        spl_df = pd.DataFrame(np.vstack(values), index=multi_idx, columns=y_cols)
+        spl_df = pd.DataFrame(values, index=multi_idx, columns=y_cols)
 
         return Empirical(spl=spl_df, index=fh_idx, columns=y_cols)
-
-    def _concat_distributions_hierarchical(self, dist_list, yvec):
-        """Concatenate Empirical distributions from vectorized prediction.
-
-        This override handles Empirical distributions properly by concatenating
-        the sample DataFrames with proper hierarchical indexing.
-
-        Parameters
-        ----------
-        dist_list : list of skpro Empirical
-            List of Empirical distributions from each instance.
-        yvec : VectorizedDF
-            The vectorized data structure with instance information.
-
-        Returns
-        -------
-        concat_dist : skpro Empirical
-            Concatenated Empirical distribution with proper hierarchical index.
-        """
-        from skpro.distributions import Empirical
-
-        if len(dist_list) == 0:
-            raise ValueError("Cannot concatenate empty list of distributions")
-
-        if len(dist_list) == 1:
-            return dist_list[0]
-
-        # Get the instance indices from the vectorized structure
-        row_idx, _ = yvec.get_iter_indices()
-
-        # If row_idx is None, concatenate using integer indices as instance identifiers
-        if row_idx is None:
-            row_idx = pd.RangeIndex(len(dist_list))
-
-        # Build concatenated sample DataFrames
-        spl_dfs = []
-        combined_indices = []
-
-        for i, dist in enumerate(dist_list):
-            # Get the sample DataFrame from this Empirical distribution
-            spl = dist.spl  # DataFrame with MultiIndex (sample, time)
-
-            # Get the instance identifier for this distribution
-            instance_idx = row_idx[i]  # This is a tuple like ('h0_0', 'h1_0')
-
-            # Create new MultiIndex with sample level first, then instance levels + time
-            if isinstance(spl.index, pd.MultiIndex):
-                # spl has MultiIndex (sample, time)
-                sample_level = spl.index.get_level_values(0)
-                time_level = spl.index.get_level_values(-1)  # Last level is time
-
-                if isinstance(instance_idx, tuple):
-                    # Multiple hierarchy levels
-                    new_tuples = [
-                        (s,) + instance_idx + (t,)
-                        for s, t in zip(sample_level, time_level)
-                    ]
-                else:
-                    # Single hierarchy level
-                    new_tuples = [
-                        (s, instance_idx, t) for s, t in zip(sample_level, time_level)
-                    ]
-
-                # Get names: sample first, then instance names, then time
-                spl_sample_name = spl.index.names[0]  # usually "sample"
-
-                if isinstance(row_idx, pd.MultiIndex):
-                    instance_names = list(row_idx.names)
-                else:
-                    instance_names = [
-                        row_idx.name if hasattr(row_idx, "name") else "level_0"
-                    ]
-
-                spl_time_name = spl.index.names[-1]  # Last name is time
-                new_names = [spl_sample_name] + instance_names + [spl_time_name]
-
-                new_spl_index = pd.MultiIndex.from_tuples(new_tuples, names=new_names)
-            else:
-                new_spl_index = spl.index
-
-            # Create new DataFrame with updated index
-            new_spl = spl.copy()
-            new_spl.index = new_spl_index
-            spl_dfs.append(new_spl)
-
-            # Also update the distribution index (instance + time points)
-            dist_index = dist.index
-            if isinstance(instance_idx, tuple):
-                new_dist_tuples = [instance_idx + (t,) for t in dist_index]
-            else:
-                new_dist_tuples = [(instance_idx, t) for t in dist_index]
-
-            if isinstance(row_idx, pd.MultiIndex):
-                instance_names = list(row_idx.names)
-            else:
-                instance_names = [
-                    row_idx.name if hasattr(row_idx, "name") else "level_0"
-                ]
-            time_name = dist_index.name if dist_index.name is not None else "time"
-
-            new_dist_index = pd.MultiIndex.from_tuples(
-                new_dist_tuples,
-                names=instance_names + [time_name],
-            )
-            combined_indices.append(new_dist_index)
-
-        # Concatenate all sample DataFrames
-        combined_spl = pd.concat(spl_dfs, axis=0)
-
-        # Concatenate all distribution indices
-        full_index = combined_indices[0]
-        for idx in combined_indices[1:]:
-            full_index = full_index.append(idx)
-
-        # Get columns from first distribution
-        columns = dist_list[0].columns
-
-        # Create the combined Empirical distribution
-        return Empirical(spl=combined_spl, index=full_index, columns=columns)
 
     @classmethod
     def get_test_params(cls, parameter_set="default"):

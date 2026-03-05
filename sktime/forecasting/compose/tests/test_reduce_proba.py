@@ -123,6 +123,77 @@ def test_with_exogenous():
 
 
 @pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_with_exogenous_missing_first_future_index():
+    """Test exogenous fallback when first prediction-time index is missing in X."""
+    y, X = load_longley()
+    y_train, y_test, X_train, X_test = temporal_train_test_split(y, X, test_size=3)
+    fh = ForecastingHorizon(y_test.index, is_relative=False)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=2,
+        n_samples=20,
+        random_state=42,
+    )
+
+    # Drop first future row to trigger fallback in exogenous slicing logic
+    X_test_missing = X_test.iloc[1:]
+
+    forecaster.fit(y_train, X=X_train)
+    y_pred = forecaster.predict(fh, X=X_test_missing)
+
+    assert len(y_pred) == len(y_test)
+    assert not y_pred.isna().any()
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_with_exogenous_missing_first_future_index_hierarchical():
+    """Test exogenous fallback for hierarchical data
+    with missing first future index."""
+    y = _make_hierarchical(
+        hierarchy_levels=(2, 2),
+        max_timepoints=30,
+        min_timepoints=30,
+        n_columns=1,
+        random_state=42,
+    )
+
+    # Create exogenous data with same index structure
+    np.random.seed(42)
+    X = pd.DataFrame(
+        index=y.index,
+        data={"exog1": np.random.randn(len(y)), "exog2": np.random.randn(len(y))},
+    )
+
+    y_train, y_test, X_train, X_test = temporal_train_test_split(y, X, test_size=5)
+    fh = ForecastingHorizon(np.arange(1, 6), is_relative=True)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=5,
+        n_samples=10,
+        pooling="global",
+        random_state=42,
+    )
+
+    # Drop first future row per series to trigger fallback on first fh step.
+    instance_levels = list(range(X_test.index.nlevels - 1))
+    X_test_missing = X_test.groupby(
+        level=instance_levels,
+        group_keys=False,
+    ).apply(lambda x: x.iloc[1:])
+
+    forecaster.fit(y_train, X=X_train)
+    y_pred = forecaster.predict(fh, X=X_test_missing)
+
+    # Should still produce predictions for all hierarchical levels
+    assert isinstance(y_pred, pd.DataFrame)
+    assert len(y_pred) == len(y_test)
+    assert y_pred.index.nlevels == 3  # h0, h1, time
+    assert not y_pred.isna().any().any()
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
 def test_reproducibility_with_random_state():
     """Test that same random_state produces identical results."""
     y = load_airline()
@@ -278,3 +349,131 @@ def test_invalid_pooling_raises():
             window_length=3,
             pooling="invalid",
         )
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_in_sample_horizon_rejected():
+    """In-sample horizons should be rejected for point and probabilistic prediction."""
+    y = load_airline()[:60]
+    fh_in_sample = ForecastingHorizon([-1, 1], is_relative=True)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=6,
+        n_samples=10,
+        random_state=42,
+    )
+
+    forecaster.fit(y)
+
+    with pytest.raises(NotImplementedError, match="in-sample"):
+        forecaster.predict(fh_in_sample)
+
+    with pytest.raises(NotImplementedError, match="in-sample"):
+        forecaster.predict_proba(fh_in_sample)
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_multivariate_y_smoke():
+    """Multivariate y should produce multivariate point and probabilistic forecasts."""
+    y = load_airline()[:80]
+    y = pd.concat([y.rename("y1"), (y * 1.1).rename("y2")], axis=1)
+    y_train, y_test = temporal_train_test_split(y, test_size=6)
+    fh = ForecastingHorizon(y_test.index, is_relative=False)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=6,
+        n_samples=20,
+        random_state=42,
+    )
+
+    forecaster.fit(y_train)
+    y_pred = forecaster.predict(fh)
+    pred_dist = forecaster.predict_proba(fh)
+
+    assert isinstance(y_pred, pd.DataFrame)
+    assert y_pred.shape == (len(fh), 2)
+    assert list(y_pred.columns) == ["y1", "y2"]
+
+    dist_mean = pred_dist.mean()
+    assert isinstance(dist_mean, pd.DataFrame)
+    assert dist_mean.shape == (len(fh), 2)
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_predict_interval_and_quantiles_smoke():
+    """Smoke test for predict_interval and predict_quantiles."""
+    y = load_airline()[:80]
+    y_train, _ = temporal_train_test_split(y, test_size=10)
+    fh = ForecastingHorizon([1, 2, 3], is_relative=True)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=6,
+        n_samples=20,
+        random_state=42,
+    )
+
+    forecaster.fit(y_train)
+
+    pred_int = forecaster.predict_interval(fh, coverage=[0.8])
+    pred_q = forecaster.predict_quantiles(fh, alpha=[0.1, 0.9])
+
+    assert isinstance(pred_int, pd.DataFrame)
+    assert len(pred_int) == len(fh)
+    assert isinstance(pred_q, pd.DataFrame)
+    assert len(pred_q) == len(fh)
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_short_series_warns_and_falls_back_to_mean():
+    """Fit should warn and fallback to constant mean for too-short series."""
+    y = load_airline()[:3]
+    fh = ForecastingHorizon([1, 2], is_relative=True)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=10,
+        impute_method=None,
+        n_samples=10,
+        random_state=42,
+    )
+
+    with pytest.warns(UserWarning, match="Falling back to constant mean forecasts"):
+        forecaster.fit(y)
+
+    y_pred = forecaster.predict(fh)
+
+    assert len(y_pred) == len(fh)
+    assert not y_pred.isna().any()
+
+
+@pytest.mark.skipif(not SKPRO_INSTALLED, reason="skpro required")
+def test_vectorized_predict_proba_concat_path_smoke():
+    """Exercise vectorized predict_proba concatenation path for local pooling."""
+    y = _make_hierarchical(
+        hierarchy_levels=(2, 2),
+        max_timepoints=30,
+        min_timepoints=30,
+        n_columns=1,
+        random_state=42,
+    )
+    y_train, y_test = temporal_train_test_split(y, test_size=3)
+    fh = ForecastingHorizon([1, 2, 3], is_relative=True)
+
+    forecaster = MCRecursiveProbaReductionForecaster(
+        estimator=_make_probabilistic_regressor(),
+        window_length=5,
+        n_samples=5,
+        pooling="local",
+        random_state=42,
+    )
+
+    forecaster.fit(y_train)
+    pred_dist = forecaster.predict_proba(fh)
+    dist_mean = pred_dist.mean()
+
+    assert isinstance(dist_mean, pd.DataFrame)
+    assert dist_mean.index.nlevels == 3
+    assert len(dist_mean) == len(y_test)
