@@ -863,16 +863,20 @@ def evaluate(
         yx_splits = gen_y_X_train_test(y, X, cv, cv_X)
 
     # sequential strategies cannot be parallelized
-    not_parallel = strategy in ["update", "no-update_params"]
+    is_sequential_strategy = strategy in ["update", "no-update_params"]
 
-    if results_callback is not None and not not_parallel and backend is not None:
+    if (
+        results_callback is not None
+        and not is_sequential_strategy
+        and backend is not None
+    ):
         raise ValueError(
             "`results_callback` requires sequential evaluation. "
             "Set `backend=None` or use a sequential strategy."
         )
 
     # dispatch by backend and strategy
-    if not_parallel:
+    if is_sequential_strategy:
         results = _evaluate_sequential(
             yx_splits=yx_splits,
             meta=_evaluate_window_kwargs,
@@ -901,7 +905,7 @@ def evaluate(
             )
 
     # final formatting of dask dataframes
-    if backend in ["dask", "dask_lazy"] and not not_parallel:
+    if backend in ["dask", "dask_lazy"] and not is_sequential_strategy:
         import dask.dataframe as dd
 
         metadata = _get_column_order_and_datatype(
