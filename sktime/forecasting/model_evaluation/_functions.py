@@ -381,6 +381,22 @@ def _apply_results_callback(results_callback, result):
     return callback_result.reset_index(drop=True)
 
 
+def _evaluate_sequential(yx_splits, meta, strategy, results_callback):
+    """Evaluate sequentially and apply optional callback fold by fold."""
+    results = []
+
+    for x in enumerate(yx_splits):
+        is_first = x[0] == 0
+        if strategy == "update" or (strategy == "no-update_params" and is_first):
+            result, forecaster = _evaluate_window(x, meta)
+            meta["forecaster"] = forecaster
+        else:
+            result = _evaluate_window(x, meta)
+        results.append(_apply_results_callback(results_callback, result))
+
+    return results
+
+
 def gen_y_X_train_test_global(y, X, cv, cv_X, cv_global, cv_global_temporal):
     """Generate joint splits of y, X as per cv, cv_X.
 
@@ -857,22 +873,20 @@ def evaluate(
 
     # dispatch by backend and strategy
     if not_parallel:
-        # Run temporal cross-validation sequentially
-        results = []
-        for x in enumerate(yx_splits):
-            is_first = x[0] == 0  # first iteration
-            if strategy == "update" or (strategy == "no-update_params" and is_first):
-                result, forecaster = _evaluate_window(x, _evaluate_window_kwargs)
-                _evaluate_window_kwargs["forecaster"] = forecaster
-            else:
-                result = _evaluate_window(x, _evaluate_window_kwargs)
-            results.append(_apply_results_callback(results_callback, result))
+        results = _evaluate_sequential(
+            yx_splits=yx_splits,
+            meta=_evaluate_window_kwargs,
+            strategy=strategy,
+            results_callback=results_callback,
+        )
     else:
         if backend is None:
-            results = []
-            for x in enumerate(yx_splits):
-                result = _evaluate_window(x, _evaluate_window_kwargs)
-                results.append(_apply_results_callback(results_callback, result))
+            results = _evaluate_sequential(
+                yx_splits=yx_splits,
+                meta=_evaluate_window_kwargs,
+                strategy=strategy,
+                results_callback=results_callback,
+            )
         else:
             if backend == "dask":
                 backend_in = "dask_lazy"

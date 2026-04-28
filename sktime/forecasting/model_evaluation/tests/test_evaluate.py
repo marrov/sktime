@@ -435,9 +435,14 @@ def test_evaluate_results_callback():
     )
 
     assert len(seen_columns) == cv.get_n_splits(y)
+    assert all("y_pred" in columns for columns in seen_columns)
     assert "y_train" not in out.columns
     assert "y_test" not in out.columns
     assert "y_pred" not in out.columns
+    assert "fit_time" in out.columns
+    assert "pred_time" in out.columns
+    assert "len_train_window" in out.columns
+    assert "cutoff" in out.columns
     assert f"test_{scoring.name}" in out.columns
 
 
