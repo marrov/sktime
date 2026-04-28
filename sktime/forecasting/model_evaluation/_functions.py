@@ -352,6 +352,35 @@ def _evaluate_window(x, meta):
         return result
 
 
+def _apply_results_callback(results_callback, result):
+    """Apply callback to a single-fold evaluate result."""
+    if results_callback is None:
+        return result
+
+    callback_result = results_callback(result)
+
+    if callback_result is None:
+        return result
+
+    if isinstance(callback_result, pd.Series):
+        callback_result = callback_result.to_frame().T
+    elif isinstance(callback_result, dict):
+        callback_result = pd.DataFrame([callback_result])
+
+    if not isinstance(callback_result, pd.DataFrame):
+        raise TypeError(
+            "`results_callback` must return a pandas DataFrame, Series, dict, "
+            f"or None, but returned {type(callback_result)}."
+        )
+
+    if len(callback_result) != 1:
+        raise ValueError(
+            "`results_callback` must return a single-row pandas object for each fold."
+        )
+
+    return callback_result.reset_index(drop=True)
+
+
 def gen_y_X_train_test_global(y, X, cv, cv_X, cv_global, cv_global_temporal):
     """Generate joint splits of y, X as per cv, cv_X.
 
@@ -422,6 +451,7 @@ def evaluate(
     return_model: bool = False,
     cv_global=None,
     cv_global_temporal=None,
+    results_callback: collections.abc.Callable | None = None,
 ):
     r"""Evaluate forecaster using timeseries cross-validation.
 
@@ -605,19 +635,30 @@ def evaluate(
                 y_pred = forecaster.predict(y=y_past)
                 metric(y_true, y_pred)
 
-        cv_global_temporal:  SingleWindowSplitter, default=None
-            ignored if cv_global is None. If passed, it splits the Panel temporally
-            before the instance split from cv_global is applied. This avoids
-            temporal leakage in the global evaluation across time series.
-            Has to be a SingleWindowSplitter.
-            cv is applied on the test set of the combined application of
-            cv_global and cv_global_temporal.
+    cv_global_temporal:  SingleWindowSplitter, default=None
+        ignored if cv_global is None. If passed, it splits the Panel temporally
+        before the instance split from cv_global is applied. This avoids
+        temporal leakage in the global evaluation across time series.
+        Has to be a SingleWindowSplitter.
+        cv is applied on the test set of the combined application of
+        cv_global and cv_global_temporal.
+
+    results_callback : callable, optional
+        Callback applied to each fold result before storing it in the final
+        return object. Receives a single-row ``pd.DataFrame`` for one fold and may
+        return a replacement single-row ``pd.DataFrame``, ``pd.Series``, ``dict``,
+        or ``None``. Returning a reduced row allows streaming large fold outputs to
+        external storage while keeping only compact summaries in memory.
+        To preserve fold-wise memory savings, use only with sequential evaluation,
+        i.e., ``backend=None`` or sequential strategies.
 
     Returns
     -------
     results : pd.DataFrame or dask.dataframe.DataFrame
         DataFrame that contains several columns with information regarding each
-        refit/update and prediction of the forecaster.
+        refit/update and prediction of the forecaster. If ``results_callback`` is
+        provided and returns replacement fold rows, the returned columns follow the
+        callback output instead.
         Row index is splitter index of train/test fold in ``cv``.
         Entries in the i-th row are for the i-th train/test split in ``cv``.
         Columns are as follows:
@@ -698,6 +739,16 @@ def evaluate(
     ...     return_model=True
     ... )
     >>> fitted_forecaster = results.iloc[0]["fitted_forecaster"]
+    >>>
+    >>> results = evaluate(
+    ...     forecaster=forecaster,
+    ...     y=y,
+    ...     cv=cv,
+    ...     return_data=True,
+    ...     results_callback=lambda result: result.drop(
+    ...         columns=[col for col in result.columns if col.startswith("y_")]
+    ...     ),
+    ... )
     """
     if backend in ["dask", "dask_lazy"]:
         if not _check_soft_dependencies("dask", severity="none"):
@@ -798,6 +849,12 @@ def evaluate(
     # sequential strategies cannot be parallelized
     not_parallel = strategy in ["update", "no-update_params"]
 
+    if results_callback is not None and not not_parallel and backend is not None:
+        raise ValueError(
+            "`results_callback` requires sequential evaluation. "
+            "Set `backend=None` or use a sequential strategy."
+        )
+
     # dispatch by backend and strategy
     if not_parallel:
         # Run temporal cross-validation sequentially
@@ -809,19 +866,25 @@ def evaluate(
                 _evaluate_window_kwargs["forecaster"] = forecaster
             else:
                 result = _evaluate_window(x, _evaluate_window_kwargs)
-            results.append(result)
+            results.append(_apply_results_callback(results_callback, result))
     else:
-        if backend == "dask":
-            backend_in = "dask_lazy"
+        if backend is None:
+            results = []
+            for x in enumerate(yx_splits):
+                result = _evaluate_window(x, _evaluate_window_kwargs)
+                results.append(_apply_results_callback(results_callback, result))
         else:
-            backend_in = backend
-        results = parallelize(
-            fun=_evaluate_window,
-            iter=enumerate(yx_splits),
-            meta=_evaluate_window_kwargs,
-            backend=backend_in,
-            backend_params=backend_params,
-        )
+            if backend == "dask":
+                backend_in = "dask_lazy"
+            else:
+                backend_in = backend
+            results = parallelize(
+                fun=_evaluate_window,
+                iter=enumerate(yx_splits),
+                meta=_evaluate_window_kwargs,
+                backend=backend_in,
+                backend_params=backend_params,
+            )
 
     # final formatting of dask dataframes
     if backend in ["dask", "dask_lazy"] and not not_parallel:

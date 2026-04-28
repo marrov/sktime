@@ -413,6 +413,59 @@ def test_evaluate_no_exog_against_with_exog():
     not run_test_for_class(evaluate),
     reason="run test only if softdeps are present and incrementally (if requested)",
 )
+def test_evaluate_results_callback():
+    """Check that results_callback can reduce stored fold output."""
+    y = make_forecasting_problem(n_timepoints=30, index_type="int")
+    forecaster = NaiveForecaster()
+    cv = SlidingWindowSplitter(fh=[1, 2, 3], initial_window=15, step_length=5)
+    scoring = MeanAbsolutePercentageError(symmetric=True)
+    seen_columns = []
+
+    def results_callback(result):
+        seen_columns.append(result.columns.tolist())
+        return result.drop(columns=[col for col in result.columns if col.startswith("y_")])
+
+    out = evaluate(
+        forecaster=forecaster,
+        y=y,
+        cv=cv,
+        scoring=scoring,
+        return_data=True,
+        results_callback=results_callback,
+    )
+
+    assert len(seen_columns) == cv.get_n_splits(y)
+    assert "y_train" not in out.columns
+    assert "y_test" not in out.columns
+    assert "y_pred" not in out.columns
+    assert f"test_{scoring.name}" in out.columns
+
+
+@pytest.mark.skipif(
+    not run_test_for_class(evaluate),
+    reason="run test only if softdeps are present and incrementally (if requested)",
+)
+def test_evaluate_results_callback_requires_sequential_backend():
+    """Check that results_callback rejects parallel refit backends."""
+    y = make_forecasting_problem(n_timepoints=30, index_type="int")
+    forecaster = NaiveForecaster()
+    cv = SlidingWindowSplitter(fh=[1, 2, 3], initial_window=15, step_length=5)
+
+    with pytest.raises(ValueError, match="results_callback"):
+        evaluate(
+            forecaster=forecaster,
+            y=y,
+            cv=cv,
+            scoring=MeanAbsolutePercentageError(symmetric=True),
+            results_callback=lambda result: result,
+            backend="loky",
+        )
+
+
+@pytest.mark.skipif(
+    not run_test_for_class(evaluate),
+    reason="run test only if softdeps are present and incrementally (if requested)",
+)
 @pytest.mark.skipif(
     not _check_soft_dependencies("statsmodels", severity="none"),
     reason="skip test if required soft dependency not available",
