@@ -385,13 +385,13 @@ def _evaluate_sequential(yx_splits, meta, strategy, results_callback):
     """Evaluate sequentially and apply optional callback fold by fold."""
     results = []
 
-    for x in enumerate(yx_splits):
-        is_first = x[0] == 0
+    for indexed_split in enumerate(yx_splits):
+        is_first = indexed_split[0] == 0
         if strategy == "update" or (strategy == "no-update_params" and is_first):
-            result, forecaster = _evaluate_window(x, meta)
+            result, forecaster = _evaluate_window(indexed_split, meta)
             meta["forecaster"] = forecaster
         else:
-            result = _evaluate_window(x, meta)
+            result = _evaluate_window(indexed_split, meta)
         results.append(_apply_results_callback(results_callback, result))
 
     return results
@@ -659,7 +659,7 @@ def evaluate(
         cv is applied on the test set of the combined application of
         cv_global and cv_global_temporal.
 
-    results_callback : collections.abc.Callable or None, optional
+    results_callback : collections.abc.Callable | None, optional
         Callback applied to each fold result before storing it in the final
         return object. Receives a single-row ``pd.DataFrame`` for one fold and may
         return a replacement single-row ``pd.DataFrame``, ``pd.Series``, ``dict``,
