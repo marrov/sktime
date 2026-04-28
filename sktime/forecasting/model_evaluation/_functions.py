@@ -659,7 +659,7 @@ def evaluate(
         cv is applied on the test set of the combined application of
         cv_global and cv_global_temporal.
 
-    results_callback : Callable, optional
+    results_callback : collections.abc.Callable, optional
         Callback applied to each fold result before storing it in the final
         return object. Receives a single-row ``pd.DataFrame`` for one fold and may
         return a replacement single-row ``pd.DataFrame``, ``pd.Series``, ``dict``,
